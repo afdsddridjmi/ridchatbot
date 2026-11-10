@@ -1,27 +1,23 @@
-"""La voix des correspondants : micro -> Albert ASR -> Albert chat -> voix navigateur.
-
-Code et audio non sauvegardés par l'application (session Streamlit seulement).
-Le serveur Streamlit et Albert traitent néanmoins les données ; voir README.
-"""
+"""Robavardeur RID : entretien vocal semi-automatique pour les RRI de SDD/AFD."""
 from __future__ import annotations
 
-import hmac
+import base64
 import hashlib
 import html
 import json
+import re
 from datetime import datetime, timezone
 from urllib.parse import quote
 
 import streamlit as st
-
 from albert_api import AlbertError, DEFAULT_ASR_MODEL, DEFAULT_CHAT_MODEL, chat, transcribe
+from voice_ui import voice_turn
 
-st.set_page_config(page_title="La voix des correspondants", page_icon="🎙️", layout="centered")
-
-MAX_TURNS = 7
-MAX_TEXT_CHARS = 1500
-MAX_SUMMARY_CHARS = 950
-FIRST_QUESTION = "Bonjour ! Avec un peu de recul, qu'est-ce que tu retiens de notre dernière réunion ?"
+st.set_page_config(page_title="Le robavardeur RID", page_icon="🎙️", layout="centered")
+MAX_DIALOGUE_TURNS = 7
+MAX_TEXT_CHARS = 1600
+MAX_SUMMARY_CHARS = 1250
+FIRST_QUESTION = "Bonjour ! Avec un peu de recul, qu'est-ce que tu retiens de notre dernière réunion des RRI ?"
 
 
 def setting(name: str, default: str = "") -> str:
@@ -29,264 +25,297 @@ def setting(name: str, default: str = "") -> str:
 
 
 def meeting_name() -> str:
-    return setting("MEETING_LABEL", "notre dernière réunion")[:100]
+    return setting("MEETING_LABEL", "notre dernière réunion des RRI")[:140]
 
 
-def question_focus() -> str:
-    return setting("QUESTION_CIBLEE", "Quel sujet voudrais-tu mettre en priorité à l'ordre du jour de notre prochaine réunion, et pourquoi ?")[:400]
+def focus_question() -> str:
+    return setting("QUESTION_CIBLEE", "Quel sujet devrions-nous traiter en priorité à la prochaine réunion du réseau des RRI, et pourquoi ?")[:380]
 
 
-def system_prompt(user_turns: int) -> str:
-    return f"""Tu es un facilitateur IA d'écoute pour un réseau interne de trente correspondants.
-Tu conduis un entretien ORAL (une question par prise de parole) à propos de {meeting_name()}.
-Règles : français naturel, phrases COURTES faciles à écouter ; deux phrases au maximum par réponse.
-Pose UNE question à la fois, écoute et relance ce qui est significatif : utilité, attentes,
-irritants, difficultés à relayer les messages dans les divisions, idées concrètes.
-Évite les commentaires stéréotypés et ne défends pas les organisateurs. Ne suppose pas de sentiment.
-N'exige pas de noms, de divisions, de dossiers internes ni d'éléments personnels. N'en répète pas.
-La première question a déjà été posée par l'application : ne recommence pas.
-Ne produis pas de synthèse : elle est générée séparément à la demande.
-QUESTION CIBLÉE À POSER avant de finir : {question_focus()}
-À partir de la troisième intervention du participant, assure-toi que cette question ciblée
-est posée à la prochaine occasion si elle ne l'a pas déjà été.
-Ne pose pas une deuxième fois cette question si elle figure déjà dans la conversation.
-Si le participant souhaite arrêter, remercie-le brièvement.
-Interventions utilisateur précédentes : {user_turns} ; au plus {MAX_TURNS} prises de parole au total.
-"""
+def setup_session():
+    s = st.session_state
+    s.setdefault("history", [{"role": "assistant", "content": FIRST_QUESTION}])
+    s.setdefault("phase", "dialogue")
+    s.setdefault("priority_asked", False)
+    s.setdefault("summary", None)
+    s.setdefault("summary_notice", "")
+    s.setdefault("last_error", None)
+    s.setdefault("last_audio", None)
+    s.setdefault("error_details", "")
 
 
-def summary_prompt() -> str:
-    return """Tu écris une SYNTHÈSE destinée aux animateurs du réseau, en français, uniquement
-à partir des PROPOS explicitement exprimés par ce participant. Trois rubriques, maximum 700 caractères :
-Ce qui a été utile : ...
-Ce qui serait à améliorer : ...
-Priorité proposée pour la prochaine réunion : ...
-Si une rubrique n'est pas renseignée, écrire « Non exprimé ».
-Supprime ou généralise les noms, divisions, dates ou détails reconnaissables et les informations
-personnelles ; ne crée aucun fait. La synthèse sera relue et modifiée par son auteur.
-Aucun prénom, aucune formule de politesse, aucun jugement psychologique, pas de promesse d'anonymat."""
-
-
-def send_to_albert(history: list[dict[str, str]], max_tokens: int = 200,
-                   for_summary: bool = False) -> str:
-    prompt = summary_prompt() if for_summary else system_prompt(
-        sum(m["role"] == "user" for m in history)
-    )
-    return chat(setting("ALBERT_API_KEY"),
-                [{"role": "system", "content": prompt}] + history[-17:],
-                model=setting("ALBERT_CHAT_MODEL", DEFAULT_CHAT_MODEL), max_tokens=max_tokens)
-
-
-def reset_conversation() -> None:
-    for name in list(st.session_state.keys()):
-        if name in ("history", "summary", "editable_summary", "pending", "call_now") or name.startswith(("voice_", "message_", "audio_attempt_")):
-            st.session_state.pop(name, None)
-
-
-def tts_button(sentence: str) -> None:
-    """Bouton de lecture vocale 100 % côté navigateur : aucun appel à une API TTS ici.
-
-    On n'automatise pas la lecture : navigateurs et appareils exigent souvent un clic.
-    Le texte est échappé comme littéral JavaScript, jamais injecté comme HTML non fiable.
-    """
-    literal = json.dumps(sentence[:1500], ensure_ascii=True).replace("<", "\\u003c").replace(">", "\\u003e")
-    html = """<div style="font:14px system-ui, sans-serif;display:flex;align-items:center;gap:10px">
-    <button id="speak" style="padding:8px 15px;border-radius:10px;border:1px solid #888;background:#f2f5fa;cursor:pointer">
-      🔊 Écouter la question
-    </button><span id="status" style="color:#666;font-size:12px"></span></div>
-    <script>
-    const content = __TEXT__;
-    const btn = document.getElementById('speak');
-    const status = document.getElementById('status');
-    if (!('speechSynthesis' in window)) {
-      btn.disabled = true; status.textContent = 'Voix non prise en charge par ce navigateur.';
-    } else {
-      btn.addEventListener('click', () => {
-        window.speechSynthesis.cancel();
-        const u = new SpeechSynthesisUtterance(content);
-        u.lang = 'fr-FR'; u.rate = 0.96; u.pitch = 1.0;
-        const voices = window.speechSynthesis.getVoices();
-        const french = voices.find(v => v.lang.toLowerCase() === 'fr-fr')
-          || voices.find(v => v.lang.toLowerCase().startsWith('fr'));
-        if (french) u.voice = french;
-        u.onstart = () => { status.textContent = 'Lecture en cours…'; };
-        u.onend = () => { status.textContent = ''; };
-        u.onerror = () => { status.textContent = 'Lecture indisponible sur cet appareil.'; };
-        window.speechSynthesis.speak(u);
-      });
-    }
-    </script>""".replace("__TEXT__", literal)
-    st.iframe(html, height=60)
-
-
-def record_user_message(text: str) -> None:
-    cleaned = text.strip()[:MAX_TEXT_CHARS]
-    if not cleaned:
-        st.warning("Aucune réponse à envoyer.")
-        return
-    st.session_state.history.append({"role": "user", "content": cleaned})
-    st.session_state.pending = True
-    st.session_state.call_now = True
+def reset_conversation():
+    for key in list(st.session_state.keys()):
+        if key in ("history", "phase", "priority_asked", "summary", "summary_notice", "last_error",
+                   "last_audio", "error_details", "editable_summary", "rid_microphone"):
+            del st.session_state[key]
     st.rerun()
 
 
-def mailto_link(email: str, summary: str) -> str:
-    subject = f"Retour collectif après {meeting_name()}"
-    body = "Bonjour,\n\nVoici mes éléments de retour, que j'ai vérifiés avant envoi :\n\n" + summary + "\n"
-    return ("mailto:" + quote(email, safe="@+.-")
-            + "?subject=" + quote(subject, safe="")
-            + "&body=" + quote(body, safe=""))
+def user_turns() -> int:
+    return sum(m["role"] == "user" for m in st.session_state.history)
 
 
-st.title("La voix des correspondants")
-st.caption("Un échange vocal libre, à tour de rôle — environ 5 minutes")
-required = ("ALBERT_API_KEY", "ACCESS_CODE", "RESULT_EMAIL", "OPEN_UNTIL_UTC")
-missing = [name for name in required if not setting(name)]
-if missing:
-    st.error("Configuration manquante : " + ", ".join(missing) + ". Contactez l'organisateur.")
-    st.stop()
+def history_context(limit: int = 12) -> list[dict[str, str]]:
+    return [{"role": m["role"], "content": m["content"][:800]}
+            for m in st.session_state.history[-limit:]]
 
-try:
-    closing = datetime.fromisoformat(setting("OPEN_UNTIL_UTC").replace("Z", "+00:00"))
-    if closing.tzinfo is None:
-        raise ValueError("Fuseau manquant")
-except ValueError:
-    st.error("Date de clôture OPEN_UNTIL_UTC incorrecte dans la configuration.")
-    st.stop()
 
-if datetime.now(timezone.utc) > closing:
-    st.info("Cette campagne de recueil est terminée.")
-    st.stop()
+def prompt_dialogue() -> str:
+    return f"""Tu es l'assistant d'écoute de RID (Résultats et Impacts de Développement), équipe de la direction exécutive SDD (Solutions de Développement Durable) de l'AFD (Agence Française de Développement).
+Tu échanges avec un RRI (Responsable de Résultats et d'Impacts), correspondant de RID dans l'une des divisions techniques de SDD.
+Sujet : {meeting_name()}. Mission : comprendre les réactions des RRI, leurs attentes, irritants et propositions.
+Écoute sans défendre RID. Ne demande pas de noms, divisions, projets, cas RH ou informations sensibles.
+Une seule question orale à la fois, courte (maximum deux phrases). Pose des relances concrètes, pas un questionnaire rigide.
+Question prioritaire : {focus_question()}
+Elle est posée à part par l'application, ne la répète pas si déjà posée.
+Nombre de réponses de ce RRI : {user_turns()}.
+Tu décides quand il semble pertinent de terminer, généralement après quatre ou cinq réponses mais parfois plus tôt s'il le souhaite. Avant de terminer, tu dois demander explicitement si le RRI souhaite ajouter quelque chose ou si l'entretien peut se clore.
+Réponds uniquement par un objet JSON valide, sans markdown, avec exactement les champs :
+{{"reply":"une relance courte ou une demande explicite de confirmation de fin", "action":"continue"}}
+Le champ action peut être "continue" ou "confirm_end". Choisis confirm_end seulement si tu souhaites demander à ce RRI si l'entretien peut se terminer, jamais pour annoncer la synthèse.
+"""
 
-if not st.session_state.get("approved", False):
-    st.markdown("""Parlez à une IA qui écoute votre retour sur la réunion, puis vous propose une courte
-synthèse à relire. **Vous choisissez ensuite de l'envoyer ou non par e-mail.**
 
-L'audio et les transcriptions passent par **Streamlit Community Cloud** et **Albert API**.
-Le programme ne constitue pas de base de données, mais ces fournisseurs peuvent traiter ou
-journaliser des données techniques selon leurs conditions. **Ne communiquez aucun nom, division,
-dossier sensible ou élément permettant d'identifier une personne.**
+def prompt_summary() -> str:
+    return """Rédige en français une synthèse brève, strictement fondée sur les propos fournis.
+Maximum 850 caractères. Exactement ces rubriques :
+Ce que je retiens de la réunion :
+Ce qui me serait plus utile / irritants :
+Priorité pour la prochaine réunion :
+Ne déduis pas d'émotions, n'invente aucun fait. Écarte les noms propres, divisions et détails identifiants.
+Si une rubrique est absente, écris « Non exprimé ». Pas de formule de politesse."""
 
-L'e-mail final part de **votre messagerie** : les animateurs voient votre adresse et le message
-est donc **identifiable par eux**. Seule la restitution au réseau est prévue sous forme collective.
-La participation est volontaire et vous pouvez quitter la page sans envoi.""")
-    provided_code = st.text_input("Code de campagne communiqué dans le mail", type="password")
-    consent = st.checkbox("J'ai compris les conditions et je souhaite participer.")
-    if st.button("Commencer", type="primary", disabled=not (provided_code and consent)):
-        attempts = st.session_state.get("failed_attempts", 0)
-        if attempts >= 5:
-            st.error("Trop de tentatives dans cette session. Fermez la page et contactez l'organisateur.")
-        elif hmac.compare_digest(provided_code, setting("ACCESS_CODE")):
-            st.session_state.approved = True
-            st.rerun()
+
+def ask_albert(messages, max_tokens=220):
+    return chat(setting("ALBERT_API_KEY"), messages,
+                model=setting("ALBERT_CHAT_MODEL", DEFAULT_CHAT_MODEL), max_tokens=max_tokens)
+
+
+def _parse_dialogue_json(raw: str) -> tuple[str, str]:
+    cleaned = raw.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", cleaned, flags=re.I)
+    try:
+        data = json.loads(cleaned)
+    except (json.JSONDecodeError, TypeError):
+        match = re.search(r"\{.*\}", cleaned, re.S)
+        if match:
+            try:
+                data = json.loads(match.group(0))
+            except json.JSONDecodeError:
+                return cleaned[:450], "continue"
         else:
-            st.session_state.failed_attempts = attempts + 1
-            st.error("Code incorrect.")
+            return cleaned[:450], "continue"
+    if not isinstance(data, dict):
+        return "Peux-tu m'en dire un peu plus ?", "continue"
+    text = str(data.get("reply", "Peux-tu m'en dire un peu plus ?")).strip()[:450]
+    action = data.get("action", "continue")
+    return text or "Peux-tu m'en dire un peu plus ?", action if action in ("continue", "confirm_end") else "continue"
+
+
+def confirm_question() -> str:
+    return "Merci. Avant de terminer, est-ce que tu souhaites ajouter quelque chose ou pouvons-nous conclure l'entretien ?"
+
+
+def confirmation_is_yes(text: str) -> bool:
+    text = text.strip().lower()
+    return bool(re.search(r"^(oui|ok\b|d.accord|on peut (terminer|conclure)|c.est (bon|tout)|terminons|je n.ai (rien|pas) (d.autre|de plus)|rien (d.autre|à ajouter)|non[, .]*(rien|c.est|je n.ai)|pas (d.autre|de plus)|tout est dit|merci c.est tout)", text))
+
+
+def confirmation_is_no(text: str) -> bool:
+    text = text.strip().lower()
+    return bool(re.search(r"^(non (je veux|pas encore|attends)|attends|j.ai (encore|aussi)|je voudrais (ajouter|préciser)|encore (un|une)|pas encore)", text))
+
+
+def prepare_summary():
+    """Une requête courte ; si Albert échoue, brouillon local éditable (pas de 2e coût API)."""
+    s = st.session_state
+    user_texts = [m["content"] for m in s.history if m["role"] == "user"]
+    context = "\n".join(f"Contribution {i+1} : {v[:600]}" for i, v in enumerate(user_texts[-7:]))
+    try:
+        result = ask_albert([{"role":"system","content":prompt_summary()},
+                             {"role":"user","content":context}], max_tokens=300)
+        s.summary = result[:MAX_SUMMARY_CHARS]
+        s.summary_notice = ""
+    except AlbertError as exc:
+        s.summary_notice = (f"La synthèse automatique n'a pas abouti ({exc}). "
+                            "Vos réponses sont conservées dans cette session ; voici un brouillon de secours à modifier.")
+        # Brouillon de secours explicite, sans prétendre à une anonymisation automatique.
+        snippets = "\n".join(f"- {v[:220]}" for v in user_texts[-4:])
+        s.summary = ("Ce que je retiens de la réunion :\nÀ compléter.\n\n"
+                     "Ce qui me serait plus utile / irritants :\nÀ compléter.\n\n"
+                     "Priorité pour la prochaine réunion :\nÀ compléter.\n\n"
+                     "Mes propos à reformuler et dépersonnaliser avant envoi :\n" + snippets)[:MAX_SUMMARY_CHARS]
+    s.editable_summary = s.summary
+    s.phase = "done"
+
+
+def respond(text: str):
+    s = st.session_state
+    cleaned = text.strip()[:MAX_TEXT_CHARS]
+    if not cleaned or s.phase == "done":
+        return
+    s.last_error = None
+    s.history.append({"role": "user", "content": cleaned})
+    n = user_turns()
+    if s.phase == "confirmation":
+        if confirmation_is_yes(cleaned):
+            prepare_summary()
+            return
+        if not confirmation_is_no(cleaned):
+            # Un propos supplémentaire doit être exploré plutôt que considéré comme une validation.
+            if len(cleaned) <= 50 and ("oui" in cleaned.lower() or "termin" in cleaned.lower()):
+                prepare_summary()
+                return
+        s.phase = "dialogue"
+    if n >= 3 and not s.priority_asked:
+        s.priority_asked = True
+        s.history.append({"role": "assistant", "content": focus_question()})
+        return
+    if n >= MAX_DIALOGUE_TURNS:
+        s.phase = "confirmation"
+        s.history.append({"role": "assistant", "content": confirm_question()})
+        return
+    try:
+        text_reply, action = _parse_dialogue_json(ask_albert(
+            [{"role": "system", "content": prompt_dialogue()}] + history_context(), max_tokens=230))
+        if action == "confirm_end":
+            s.phase = "confirmation"
+            # Forcer une vraie confirmation avant tout résumé.
+            if not any(w in text_reply.lower() for w in ("termin", "conclu", "ajouter", "autre chose", "fini")):
+                text_reply = confirm_question()
+        s.history.append({"role": "assistant", "content": text_reply})
+    except AlbertError as exc:
+        s.last_error = str(exc)
+        s.error_details = f"HTTP {exc.status or 'réseau'} · {exc.category}"
+        # Ne pas perdre la réponse : poser une relance utilisable sans nouvel appel.
+        if n >= 4:
+            s.phase = "confirmation"
+            fallback = confirm_question()
+        else:
+            fallback = "Merci pour ce retour. Quel changement concret te serait le plus utile dans le réseau des RRI ?"
+        s.history.append({"role":"assistant", "content":fallback})
+
+
+def mailto_link(recipient: str, summary: str) -> str:
+    subject = f"Retour RRI – {meeting_name()}"
+    body = ("Bonjour l'équipe RID,\n\nVoici mon retour, relu et validé avant envoi :\n\n"
+            + summary + "\n\n")
+    return "mailto:" + quote(recipient, safe="@+.-") + "?subject=" + quote(subject, safe="") + "&body=" + quote(body, safe="")
+
+
+# ===== Écran principal =====
+st.title("Le robavardeur de chez RID")
+st.caption("Réseau des RRI · Direction exécutive SDD · AFD")
+
+needed = ("ALBERT_API_KEY", "RESULT_EMAIL")
+missing = [v for v in needed if not setting(v)]
+if missing:
+    st.error("Configuration manquante : " + ", ".join(missing))
     st.stop()
 
-if "history" not in st.session_state:
-    st.session_state.history = [{"role": "assistant", "content": FIRST_QUESTION}]
+close_date = setting("OPEN_UNTIL_UTC")
+if close_date:
+    try:
+        closing = datetime.fromisoformat(close_date.replace("Z", "+00:00"))
+        if closing.tzinfo is None:
+            raise ValueError("Timezone")
+    except ValueError:
+        st.error("Date OPEN_UNTIL_UTC mal configurée (ISO 8601 avec fuseau).")
+        st.stop()
+    if datetime.now(timezone.utc) > closing:
+        st.info("Cette campagne d'écoute est terminée.")
+        st.stop()
 
-c1, c2 = st.columns([1, 1])
+setup_session()
+with st.expander("Confidentialité et utilisation — à lire avant de commencer", expanded=False):
+    st.markdown("""Tu échanges avec un agent IA utilisant **Albert API**, dans le cadre d'un test organisé par
+l'équipe **RID** auprès des **RRI** des divisions techniques de **SDD (AFD)**.
+L'échange est facultatif. Évite les noms, dossiers sensibles et détails identifiants.
+Le service Streamlit héberge l'application et transmet temporairement l'audio à Albert pour transcription ;
+les fournisseurs peuvent conserver des journaux techniques selon leurs conditions.
+Aucune conversation n'est sauvegardée dans une base de données de cette application.
+**L'e-mail final est identifiable par son expéditeur**, même si seules des tendances collectives seront
+restituées au réseau. Tu pourras corriger la synthèse avant de l'envoyer ou fermer sans rien envoyer.
+La première activation vocale demande l'autorisation du microphone ; les suivantes sont automatisées
+lorsque le navigateur le permet.""")
+
+c1, c2 = st.columns([2,1])
 with c1:
-    if st.button("Effacer l'échange", help="Efface les éléments de cette session applicative"):
-        reset_conversation()
-        st.rerun()
+    st.caption(f"Réunion : {meeting_name()}")
 with c2:
-    st.caption("Aucun envoi sans votre validation")
-
-for message in st.session_state.history:
-    with st.chat_message(message["role"]):
-        st.write(message["content"])
-
-if st.session_state.history[-1]["role"] == "assistant" and "summary" not in st.session_state:
-    tts_button(st.session_state.history[-1]["content"])
-    st.caption("La voix est celle de votre navigateur ; cliquez sur « Écouter la question ». ")
-
-user_turns = sum(m["role"] == "user" for m in st.session_state.history)
-
-if st.session_state.get("pending", False):
-    if st.session_state.get("call_now", False):
-        st.session_state.call_now = False
-        with st.spinner("Albert prépare sa relance…"):
-            try:
-                reply = send_to_albert(st.session_state.history)
-                st.session_state.history.append({"role": "assistant", "content": reply})
-                st.session_state.pending = False
-                st.rerun()
-            except AlbertError as exc:
-                st.error(str(exc))
-    if st.button("Réessayer la relance"):
-        st.session_state.call_now = True
-        st.rerun()
-    st.info("Votre dernière réponse reste dans la session. Vous pouvez réessayer sans la réenregistrer.")
-    # La synthèse reste possible même si la dernière relance a échoué.
-
-if "summary" not in st.session_state:
-    if user_turns < MAX_TURNS and not st.session_state.get("pending", False):
-        st.markdown(f"**À vous de répondre** · intervention {user_turns + 1}/{MAX_TURNS}")
-        vocal_tab, text_tab = st.tabs(["🎤 Parler", "⌨️ Écrire (secours)"])
-        with vocal_tab:
-            st.caption("Appuyez sur le micro, parlez, puis arrêtez : la transcription démarre automatiquement.")
-            recording = st.audio_input("Enregistrer votre réponse (90 secondes maximum)",
-                                       sample_rate=16000, key=f"voice_{user_turns}")
-            if recording is not None:
-                data = recording.getvalue()
-                audio_hash = hashlib.sha256(data).hexdigest()
-                attempt_key = f"audio_attempt_{user_turns}"
-                if st.session_state.get(attempt_key) != audio_hash:
-                    # Empêche la même prise de parole d'être envoyée à nouveau sur un rerun.
-                    st.session_state[attempt_key] = audio_hash
-                    with st.spinner("Albert transcrit votre voix…"):
-                        try:
-                            result = transcribe(setting("ALBERT_API_KEY"), data,
-                                                model=setting("ALBERT_ASR_MODEL", DEFAULT_ASR_MODEL))
-                            record_user_message(result)
-                        except AlbertError as exc:
-                            st.error(str(exc))
-                            st.info("Réenregistrez votre réponse, réessayez ou choisissez Écrire.")
-                elif st.button("Réessayer la transcription", key=f"retry_audio_{user_turns}"):
-                    st.session_state.pop(attempt_key, None)
-                    st.rerun()
-        with text_tab:
-            with st.form(key=f"text_form_{user_turns}", clear_on_submit=True):
-                written = st.text_area("Votre réponse", max_chars=MAX_TEXT_CHARS,
-                                       placeholder="Vous pouvez répondre par écrit si vous préférez.")
-                submitted = st.form_submit_button("Envoyer mon texte")
-            if submitted:
-                record_user_message(written)
-    elif user_turns >= MAX_TURNS:
-        st.info("La limite de prises de parole de ce pilote est atteinte. Vous pouvez préparer votre synthèse.")
-
-    if user_turns >= 1 and st.button("Terminer et préparer ma synthèse", type="primary"):
-        with st.spinner("Albert rédige une synthèse des propos exprimés…"):
-            try:
-                result = send_to_albert(st.session_state.history, max_tokens=350,
-                                        for_summary=True)[:MAX_SUMMARY_CHARS]
-                st.session_state.summary = result
-                st.session_state.editable_summary = result
-                st.rerun()
-            except AlbertError as exc:
-                st.error(str(exc))
-else:
-    st.divider()
-    st.subheader("Votre synthèse à vérifier")
-    st.info("Vous pouvez corriger, raccourcir ou supprimer tout détail reconnaissable.")
-    st.text_area("Texte qui sera placé dans le brouillon de mail", key="editable_summary",
-                 height=190, max_chars=MAX_SUMMARY_CHARS)
-    summary = st.session_state.editable_summary.strip()
-    if summary:
-        st.markdown("**Copie de secours :**")
-        st.code(summary, language=None)
-        safe_mailto = html.escape(mailto_link(setting("RESULT_EMAIL"), summary), quote=True)
-        st.markdown(
-            f'<a href="{safe_mailto}" style="display:inline-block;padding:10px 15px;'
-            'border-radius:8px;background:#1459a5;color:white;text-decoration:none;'
-            'font-weight:600">Ouvrir un brouillon d’e-mail</a>',
-            unsafe_allow_html=True,
-        )
-        st.caption("Le bouton ouvre le logiciel mail associé aux liens mailto sur cet appareil."
-                   " L'envoi n'est jamais automatique. Si Outlook ne s'ouvre pas, copiez le texte affiché.")
-    if st.button("Nouvel échange"):
+    if st.button("Effacer l'échange"):
         reset_conversation()
-        st.rerun()
+
+s = st.session_state
+if s.phase != "done":
+    # L'interface met l'accent sur le dernier tour ; historique facultatif.
+    latest = s.history[-1]
+    if latest["role"] != "assistant":
+        s.history.append({"role": "assistant", "content": confirm_question()})
+        latest = s.history[-1]
+    question_id = hashlib.sha256((str(len(s.history)) + latest["content"]).encode()).hexdigest()[:16]
+    st.markdown(f"**Échange {user_turns()+1}** · environ 5 minutes au total")
+    if user_turns() == 0:
+        st.caption("En cliquant sur « Démarrer », vous acceptez les conditions présentées dans l’encadré de confidentialité. Le navigateur peut demander l’autorisation d’utiliser le micro.")
+    voice = voice_turn(latest["content"], question_id, auto_start=(user_turns()>0))
+    if voice.audio:
+        event = voice.audio
+        if isinstance(event, dict) and event.get("turn_id") == question_id and isinstance(event.get("wav_base64"), str):
+            raw = event["wav_base64"]
+            if len(raw) > 10_000_000:
+                st.error("Audio trop volumineux. Répondez en texte ou réessayez.")
+            else:
+                try:
+                    payload = base64.b64decode(raw, validate=True)
+                    with st.spinner("Albert transcrit la réponse…"):
+                        transcript = transcribe(setting("ALBERT_API_KEY"), payload,
+                                                model=setting("ALBERT_ASR_MODEL", DEFAULT_ASR_MODEL))
+                    with st.spinner("Albert prépare sa relance…"):
+                        respond(transcript)
+                    st.rerun()
+                except (AlbertError, ValueError) as exc:
+                    st.error(f"Problème de transcription : {exc}")
+                    st.info("Vous pouvez utiliser le clavier ci-dessous sans perdre votre échange.")
+    elif voice.finish_request:
+        event = voice.finish_request
+        if isinstance(event, dict) and event.get("turn_id") == question_id:
+            s.phase = "confirmation"
+            s.history.append({"role":"assistant", "content": confirm_question()})
+            st.rerun()
+
+    if s.last_error:
+        st.warning(f"Albert n'a pas pu générer la dernière relance ({s.error_details}). "
+                   "Une question de secours a été proposée. Vous pouvez continuer.")
+    with st.expander("Répondre par écrit à la place", expanded=False):
+        with st.form("text_fallback", clear_on_submit=True):
+            answer = st.text_area("Ma réponse", max_chars=MAX_TEXT_CHARS)
+            submitted = st.form_submit_button("Envoyer ma réponse")
+        if submitted and answer.strip():
+            with st.spinner("Albert prépare sa relance…"):
+                respond(answer)
+            st.rerun()
+    with st.expander("Relire l'échange", expanded=False):
+        for m in s.history:
+            st.markdown(("**RRI :** " if m["role"] == "user" else "**Assistant :** ") +
+                        html.escape(m["content"]))
+else:
+    st.success("L'entretien est terminé. Voici la synthèse à vérifier avant tout envoi.")
+    if s.summary_notice:
+        st.warning(s.summary_notice)
+    st.text_area("Synthèse modifiable", key="editable_summary", height=240,
+                 max_chars=MAX_SUMMARY_CHARS)
+    summary = s.editable_summary.strip()
+    st.caption("Effacez toute information permettant d'identifier un collègue ou une division. "
+               "Le message partira depuis votre propre messagerie et ne sera pas anonyme.")
+    if summary:
+        url = html.escape(mailto_link(setting("RESULT_EMAIL"), summary), quote=True)
+        st.markdown(f'<a href="{url}" target="_self" style="display:inline-block;background:#12649b;'
+                    'color:white;border-radius:10px;text-decoration:none;padding:11px 16px;font-weight:600">'
+                    'Ouvrir mon e-mail de restitution</a>', unsafe_allow_html=True)
+        st.code(summary, language=None)
+        st.caption("Si votre navigateur ne sait pas ouvrir Outlook à partir d'un lien mailto, "
+                   "copiez la synthèse et collez-la dans un nouveau message.")
+    if st.button("Nouvel entretien"):
+        reset_conversation()
