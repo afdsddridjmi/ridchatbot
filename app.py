@@ -282,12 +282,26 @@ if close_date:
 
 setup_session()
 with st.expander("Confidentialité et utilisation", expanded=False):
-    st.markdown("""Entretien facultatif avec un agent IA hébergé sur Streamlit et connecté à l'API Albert.
-L'audio est transmis pour transcription ; les services techniques peuvent avoir leurs propres journaux.
-L'application ne dispose pas de base de données d'enregistrement des échanges, mais la session en conserve
-une copie temporaire. Évite les noms, dossiers sensibles et détails qui permettraient d'identifier des personnes.
-Le récapitulatif est à relire avant son éventuel envoi : **l'e-mail identifie son expéditeur**.
-La lecture vocale démarre automatiquement si le navigateur l'autorise ; le micro peut demander une autorisation.""")
+    st.markdown("""Tu discutes avec **L'Oreille de RID**. L'Oreille de RID est une sorte de ChatGPT simplifié :
+un agent conversationnel (chatbot) de l'équipe **RID (AFD)** qui s'appuie sur le service d'intelligence
+artificielle **Albert API**, mis à disposition de l'AFD par la **Direction interministérielle du numérique (DINUM)**.
+
+La discussion avec l'Oreille est **facultative**. Le moteur d'IA Albert est conçu pour des usages professionnels
+sécurisés, mais tous les maillons de ce logiciel n'offrent pas nécessairement le même niveau de protection.
+**Évite donc de parler de données personnelles** (par exemple les noms de famille des collègues),
+**confidentielles ou bancaires** (par exemple les tarifications, les résultats financiers ou les confidences
+des contreparties).
+
+L'Oreille t'aide simplement à **rédiger un e-mail final que tu pourras modifier et envoyer — ou non — à RID**.
+**RID ne reçoit pas automatiquement le contenu de ta conversation.** Aucune base de données de cette
+application ne conserve les échanges, mais ils sont traités temporairement pendant ta session par
+**Streamlit et Albert** ; ces services peuvent conserver des journaux techniques selon leurs conditions.
+Si tu fermes ou recharges la page, **ton échange en cours peut être perdu**. Si tu envoies l'e-mail,
+RID pourra identifier son expéditeur.
+
+Lors de la première utilisation vocale, ton navigateur peut demander l'autorisation d'utiliser le microphone.
+**Si ton navigateur propose de mémoriser cette autorisation**, tu peux sélectionner cette option pour éviter
+d'avoir à l'accorder à nouveau à chaque visite.""")
 
 col_left, col_right = st.columns([3, 1])
 with col_left:
